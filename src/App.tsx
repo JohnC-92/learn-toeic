@@ -1,10 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import vocabRaw from '../toeic_vocab_processed.csv?raw';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import vocabRaw from '../toeic_vocab_ecdict.csv?raw';
 
 type VocabItem = {
   english: string;
   chinese: string;
   checkStatus: string;
+  ecdictZh: string;
+  ecdictPos: string;
+  englishKey: string;
 };
 
 type VoiceOption = {
@@ -12,6 +15,13 @@ type VoiceOption = {
   lang: string;
   voiceURI: string;
 };
+
+type DictionaryEntry = {
+  zh: string;
+  pos: string;
+};
+
+type DictionaryMap = Record<string, DictionaryEntry>;
 
 const parseCsvLine = (line: string) => {
   const values: string[] = [];
@@ -39,6 +49,31 @@ const parseCsvLine = (line: string) => {
   return values;
 };
 
+const alignRow = (parts: string[], headerLength: number) => {
+  if (parts.length === headerLength) {
+    return parts;
+  }
+
+  if (parts.length < headerLength) {
+    return [...parts, ...Array(headerLength - parts.length).fill('')];
+  }
+
+  if (headerLength <= 2) {
+    return parts.slice(0, headerLength);
+  }
+
+  const tailLength = headerLength - 2;
+  const chinese = parts.slice(1, parts.length - tailLength).join(',');
+  return [parts[0], chinese, ...parts.slice(parts.length - tailLength)];
+};
+
+const normalizeLookup = (value: string) =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/\s*\([^)]*\)\s*$/, '');
+
 const parseVocab = (raw: string): VocabItem[] => {
   const lines = raw
     .split(/\r?\n/)
@@ -49,14 +84,35 @@ const parseVocab = (raw: string): VocabItem[] => {
     return [];
   }
 
+  const header = parseCsvLine(lines[0]);
+  const headerLength = header.length;
+  const indexMap = new Map(header.map((name, index) => [name, index]));
+
+  const englishIndex = indexMap.get('English') ?? 0;
+  const chineseIndex = indexMap.get('Chinese Meanings') ?? 1;
+  const wordWithPosIndex = indexMap.get('word_with_pos') ?? englishIndex;
+  const checkStatusIndex = indexMap.get('check_status') ?? -1;
+  const ecdictZhIndex = indexMap.get('ecdict_zh') ?? -1;
+  const ecdictPosIndex = indexMap.get('ecdict_pos') ?? -1;
+
   return lines.slice(1).reduce<VocabItem[]>((items, line) => {
-    const parts = parseCsvLine(line);
-    const wordWithPos = parts[3]?.trim() ?? '';
-    const chinese = parts[1]?.trim() ?? '';
-    const checkStatus = parts[4]?.trim() ?? '';
+    const parts = alignRow(parseCsvLine(line), headerLength);
+    const englishKey = parts[englishIndex]?.trim() ?? '';
+    const wordWithPos = parts[wordWithPosIndex]?.trim() ?? englishKey;
+    const chinese = parts[chineseIndex]?.trim() ?? '';
+    const checkStatus = checkStatusIndex >= 0 ? parts[checkStatusIndex]?.trim() ?? '' : '';
+    const ecdictZh = ecdictZhIndex >= 0 ? parts[ecdictZhIndex]?.trim() ?? '' : '';
+    const ecdictPos = ecdictPosIndex >= 0 ? parts[ecdictPosIndex]?.trim() ?? '' : '';
 
     if (wordWithPos && chinese) {
-      items.push({ english: wordWithPos, chinese, checkStatus });
+      items.push({
+        english: wordWithPos,
+        chinese,
+        checkStatus,
+        ecdictZh,
+        ecdictPos,
+        englishKey,
+      });
     }
 
     return items;
@@ -169,9 +225,14 @@ export default function App() {
   const [selectedChineseVoiceURI, setSelectedChineseVoiceURI] = useState('');
   const [autoMode, setAutoMode] = useState(false);
   const [speechRate, setSpeechRate] = useState(1);
+  const [dictionary, setDictionary] = useState<DictionaryMap>({});
+  const [lookupTerm, setLookupTerm] = useState('');
+  const [lookupResult, setLookupResult] = useState<DictionaryEntry | null>(null);
+  const [lookupMessage, setLookupMessage] = useState('');
   const current = vocabItems[currentIndex];
   const total = vocabItems.length;
   const speechSupported = typeof window !== 'undefined' && 'speechSynthesis' in window;
+  const dictionaryReady = Object.keys(dictionary).length > 0;
   const currentIndexRef = useRef(currentIndex);
 
   useEffect(() => {
@@ -197,6 +258,28 @@ export default function App() {
       window.speechSynthesis.onvoiceschanged = null;
     };
   }, [speechSupported]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const loadDictionary = async () => {
+      try {
+        const response = await fetch(`${import.meta.env.BASE_URL}dict/ecdict.json`, {
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          return;
+        }
+        const data = (await response.json()) as DictionaryMap;
+        setDictionary(data);
+      } catch (error) {
+        // Ignore dictionary load errors.
+      }
+    };
+
+    loadDictionary();
+
+    return () => controller.abort();
+  }, []);
 
   const voiceMap = useMemo(() => {
     return new Map(voices.map((voice) => [voice.voiceURI, voice]));
@@ -321,6 +404,37 @@ export default function App() {
     setAutoMode((prev) => !prev);
   };
 
+  const handleLookup = () => {
+    if (!dictionaryReady) {
+      setLookupResult(null);
+      setLookupMessage('Dictionary is still loading.');
+      return;
+    }
+
+    const key = normalizeLookup(lookupTerm);
+    if (!key) {
+      setLookupResult(null);
+      setLookupMessage('Enter a word to look up.');
+      return;
+    }
+
+    const entry = dictionary[key];
+    if (!entry) {
+      setLookupResult(null);
+      setLookupMessage('No dictionary match found.');
+      return;
+    }
+
+    setLookupResult(entry);
+    setLookupMessage('');
+  };
+
+  const handleLookupKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Enter') {
+      handleLookup();
+    }
+  };
+
   return (
     <div className="min-h-screen">
       <div className="mx-auto flex min-h-screen max-w-4xl flex-col px-4 py-10 sm:px-8 sm:py-16">
@@ -362,11 +476,28 @@ export default function App() {
                   <p className="mt-2 text-xl text-muji-ink/90 sm:text-2xl">
                     {current.chinese}
                   </p>
+                  {(current.ecdictZh || current.ecdictPos) && (
+                    <div className="mt-4 rounded-2xl border border-muji-wood/40 bg-white/60 px-4 py-3">
+                      <div className="flex flex-wrap items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.25em] text-muji-accent">
+                        <span>Dictionary</span>
+                        {current.ecdictPos && (
+                          <span className="rounded-full border border-muji-wood/50 bg-muji-paper px-2 py-1 text-[10px] text-muji-ink">
+                            {current.ecdictPos}
+                          </span>
+                        )}
+                      </div>
+                      {current.ecdictZh && (
+                        <p className="mt-2 text-sm text-muji-ink/80">
+                          {current.ecdictZh}
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             ) : (
               <p className="text-lg text-muji-ink/70">
-                No entries available. Check the TSV file for valid rows.
+                No entries available. Check the CSV file for valid rows.
               </p>
             )}
           </div>
@@ -473,6 +604,60 @@ export default function App() {
                 </div>
               </div>
             )}
+            <div className="rounded-3xl border border-muji-wood/40 bg-muji-card/70 px-4 py-4 sm:px-6">
+              <div className="space-y-3">
+                <p className="text-xs font-semibold uppercase tracking-[0.3em] text-muji-accent">
+                  Dictionary Lookup
+                </p>
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+                  <div className="flex-1">
+                    <label className="text-xs font-semibold uppercase tracking-[0.2em] text-muji-ink/60">
+                      English word
+                    </label>
+                    <input
+                      className="mt-2 w-full rounded-2xl border border-muji-wood/50 bg-white/70 px-4 py-3 text-sm text-muji-ink shadow-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-muji-accent/40"
+                      placeholder="Type a word (e.g., lumber)"
+                      value={lookupTerm}
+                      onChange={(event) => {
+                        setLookupTerm(event.target.value);
+                        setLookupMessage('');
+                      }}
+                      onKeyDown={handleLookupKeyDown}
+                      disabled={!dictionaryReady}
+                    />
+                  </div>
+                  <button
+                    className="rounded-full border border-muji-accent/50 bg-muji-accent/10 px-6 py-3 text-sm font-semibold text-muji-ink shadow-soft transition hover:bg-muji-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-muji-accent/40 disabled:cursor-not-allowed disabled:opacity-60"
+                    onClick={handleLookup}
+                    type="button"
+                    disabled={!dictionaryReady}
+                  >
+                    Look up
+                  </button>
+                </div>
+                {!dictionaryReady && (
+                  <p className="text-xs text-muji-ink/60">Loading dictionary data…</p>
+                )}
+                {lookupMessage && (
+                  <p className="text-xs text-muji-ink/60">{lookupMessage}</p>
+                )}
+                {lookupResult && (
+                  <div className="rounded-2xl border border-muji-wood/40 bg-white/70 px-4 py-3 text-sm text-muji-ink/80">
+                    <div className="flex flex-wrap items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-muji-accent">
+                      <span>Result</span>
+                      {lookupResult.pos && (
+                        <span className="rounded-full border border-muji-wood/50 bg-muji-paper px-2 py-1 text-[10px] text-muji-ink">
+                          {lookupResult.pos}
+                        </span>
+                      )}
+                    </div>
+                    {lookupResult.zh && (
+                      <p className="mt-2 text-sm text-muji-ink/80">{lookupResult.zh}</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
           {!speechSupported && (
             <p className="mt-3 text-xs text-muji-ink/60">
